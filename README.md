@@ -827,4 +827,231 @@ Most orgs never get here.
 Tell me which one you want — I’ll extend this system cleanly and production-ready.
 
 
+"""
+GitLab Monthly DORA + Cost Report
+Audience: Director, CTO, PMO
+Scope: Group-level (multi-team, multi-project)
+"""
+
+import requests
+import pandas as pd
+import os
+from datetime import datetime, date, timedelta
+from dateutil.parser import parse
+
+# =========================
+# CONFIGURATION
+# =========================
+GITLAB_URL = "https://gitlab.com"
+PRIVATE_TOKEN = "glpat-XXXXXXXXXXXX"
+GROUP_ID = 12345678
+
+PER_PAGE = 100
+PROD_ENV = "prod"
+
+RUNNER_COST_PER_MINUTE = 0.008  # Adjust to your infra
+OUTPUT_ROOT = "reports"
+
+HEADERS = {"PRIVATE-TOKEN": PRIVATE_TOKEN}
+
+# =========================
+# TIME WINDOW (LAST MONTH)
+# =========================
+def last_month_range():
+    today = date.today().replace(day=1)
+    end = today - timedelta(days=1)
+    start = end.replace(day=1)
+    return start.isoformat(), end.isoformat(), end.strftime("%Y-%m")
+
+START_DATE, END_DATE, REPORT_MONTH = last_month_range()
+
+# =========================
+# GENERIC API PAGINATION
+# =========================
+def get_all_pages(url, params=None):
+    results, page = [], 1
+    while True:
+        p = params or {}
+        p.update({"page": page, "per_page": PER_PAGE})
+        r = requests.get(url, headers=HEADERS, params=p)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            break
+        results.extend(data)
+        page += 1
+    return results
+
+# =========================
+# DATA COLLECTION
+# =========================
+def fetch_projects():
+    url = f"{GITLAB_URL}/api/v4/groups/{GROUP_ID}/projects"
+    return get_all_pages(url, {"include_subgroups": True})
+
+def fetch_deployments(project_id):
+    url = f"{GITLAB_URL}/api/v4/projects/{project_id}/deployments"
+    return get_all_pages(url, {"environment": PROD_ENV})
+
+def fetch_pipelines(project_id):
+    url = f"{GITLAB_URL}/api/v4/projects/{project_id}/pipelines"
+    return get_all_pages(url, {
+        "updated_after": START_DATE,
+        "updated_before": END_DATE
+    })
+
+def fetch_jobs(project_id, pipeline_id):
+    url = f"{GITLAB_URL}/api/v4/projects/{project_id}/pipelines/{pipeline_id}/jobs"
+    return get_all_pages(url)
+
+def fetch_incidents(project_id):
+    url = f"{GITLAB_URL}/api/v4/projects/{project_id}/issues"
+    return get_all_pages(url, {
+        "labels": "type::incident,env::prod",
+        "created_after": START_DATE,
+        "created_before": END_DATE
+    })
+
+# =========================
+# MAIN AGGREGATION
+# =========================
+def collect_data():
+    deployments, pipelines, jobs, incidents = [], [], [], []
+    projects = fetch_projects()
+
+    for p in projects:
+        pid = p["id"]
+
+        for d in fetch_deployments(pid):
+            deployments.append({
+                "created_at": d["created_at"],
+                "commit_time": d["deployable"]["commit"]["created_at"]
+            })
+
+        for pl in fetch_pipelines(pid):
+            pipelines.append({
+                "created_at": pl["created_at"],
+                "status": pl["status"]
+            })
+
+            for j in fetch_jobs(pid, pl["id"]):
+                if j["duration"]:
+                    jobs.append({
+                        "created_at": j["created_at"],
+                        "duration": j["duration"]
+                    })
+
+        for i in fetch_incidents(pid):
+            if i["closed_at"]:
+                incidents.append({
+                    "created_at": i["created_at"],
+                    "closed_at": i["closed_at"]
+                })
+
+    return (
+        pd.DataFrame(deployments),
+        pd.DataFrame(pipelines),
+        pd.DataFrame(jobs),
+        pd.DataFrame(incidents)
+    )
+
+# =========================
+# DORA METRICS (MONTHLY)
+# =========================
+def calculate_dora(deploy_df, pipeline_df, incident_df):
+    deploy_df["month"] = pd.to_datetime(deploy_df["created_at"]).dt.to_period("M")
+    deploy_df["lead_time_hours"] = (
+        pd.to_datetime(deploy_df["created_at"]) -
+        pd.to_datetime(deploy_df["commit_time"])
+    ).dt.total_seconds() / 3600
+
+    pipeline_df["month"] = pd.to_datetime(pipeline_df["created_at"]).dt.to_period("M")
+    incident_df["month"] = pd.to_datetime(incident_df["created_at"]).dt.to_period("M")
+    incident_df["mttr_minutes"] = (
+        pd.to_datetime(incident_df["closed_at"]) -
+        pd.to_datetime(incident_df["created_at"])
+    ).dt.total_seconds() / 60
+
+    dora = deploy_df.groupby("month").agg(
+        prod_deployments=("created_at", "count"),
+        lead_time_hours=("lead_time_hours", "median")
+    ).reset_index()
+
+    cfr = pipeline_df.groupby("month").apply(
+        lambda x: (x["status"] == "failed").mean() * 100
+    ).reset_index(name="change_failure_rate")
+
+    mttr = incident_df.groupby("month")["mttr_minutes"].mean().reset_index()
+
+    dora = dora.merge(cfr, on="month", how="left").merge(mttr, on="month", how="left")
+    dora["month"] = dora["month"].astype(str)
+    return dora
+
+# =========================
+# CI COST
+# =========================
+def calculate_cost(jobs_df):
+    jobs_df["month"] = pd.to_datetime(jobs_df["created_at"]).dt.to_period("M")
+    jobs_df["ci_minutes"] = jobs_df["duration"] / 60
+
+    cost = jobs_df.groupby("month")["ci_minutes"].sum().reset_index()
+    cost["ci_cost"] = cost["ci_minutes"] * RUNNER_COST_PER_MINUTE
+    cost["month"] = cost["month"].astype(str)
+    return cost
+
+# =========================
+# COST VS DORA
+# =========================
+def merge_cost_dora(dora_df, cost_df):
+    df = dora_df.merge(cost_df, on="month", how="left")
+    df["deployments_per_1k_cost"] = (
+        df["prod_deployments"] / df["ci_cost"] * 1000
+    )
+    return df
+
+# =========================
+# EXECUTIVE SUMMARY
+# =========================
+def generate_summary(df, output_dir):
+    latest = df.iloc[-1]
+
+    summary = f"""
+ENGINEERING PORTFOLIO – MONTHLY SUMMARY ({latest.month})
+
+Production Deployments : {int(latest.prod_deployments)}
+Lead Time              : {round(latest.lead_time_hours / 24, 2)} days
+Change Failure Rate    : {round(latest.change_failure_rate, 2)} %
+MTTR                   : {round(latest.mttr_minutes, 1)} minutes
+CI Cost                : ${round(latest.ci_cost, 2)}
+Deployments per $1K CI : {round(latest.deployments_per_1k_cost, 1)}
+"""
+
+    with open(f"{output_dir}/executive_summary.txt", "w") as f:
+        f.write(summary.strip())
+
+# =========================
+# MAIN
+# =========================
+def main():
+    output_dir = f"{OUTPUT_ROOT}/{REPORT_MONTH}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    deploy_df, pipeline_df, jobs_df, incident_df = collect_data()
+
+    dora_df = calculate_dora(deploy_df, pipeline_df, incident_df)
+    cost_df = calculate_cost(jobs_df)
+    final_df = merge_cost_dora(dora_df, cost_df)
+
+    dora_df.to_csv(f"{output_dir}/dora_monthly.csv", index=False)
+    cost_df.to_csv(f"{output_dir}/ci_cost_monthly.csv", index=False)
+    final_df.to_csv(f"{output_dir}/cost_vs_dora.csv", index=False)
+
+    generate_summary(final_df, output_dir)
+
+    print(f"✅ Monthly GitLab report generated for {REPORT_MONTH}")
+
+if __name__ == "__main__":
+    main()
+
+
 
