@@ -1054,4 +1054,247 @@ if __name__ == "__main__":
     main()
 
 
+#!/usr/bin/env python3
+"""
+EC2 Downtime Analyzer Script
+Author: Veera Prakash (customizable)
+"""
+
+import boto3
+import traceback
+from datetime import datetime, timedelta
+from botocore.exceptions import BotoCoreError, ClientError, NoCredentialsError
+
+# ---------------- CUSTOM EXCEPTIONS ---------------- #
+
+class InstanceConnectionError(Exception):
+    pass
+
+class MetricFetchError(Exception):
+    pass
+
+class NoDataError(Exception):
+    pass
+
+
+# ---------------- MAIN FUNCTION ---------------- #
+
+def get_ec2_downtime(instance_id, region, start_date, end_date):
+    """
+    Calculates downtime using CloudWatch StatusCheckFailed metric
+    """
+
+    try:
+        print("Initializing AWS session...")
+        ec2 = boto3.client("ec2", region_name=region)
+        cw = boto3.client("cloudwatch", region_name=region)
+
+    except Exception as e:
+        print("Initialization failed")
+        traceback.print_exc()
+        raise InstanceConnectionError("Failed to initialize AWS clients") from e
+
+    # Validate instance connection
+    try:
+        ec2.describe_instances(InstanceIds=[instance_id])
+        print(f"Connected to instance {instance_id}")
+    except ClientError as e:
+        traceback.print_exc()
+        raise InstanceConnectionError(f"Instance {instance_id} not reachable") from e
+
+    # Fetch CloudWatch metrics
+    try:
+        response = cw.get_metric_statistics(
+            Namespace="AWS/EC2",
+            MetricName="StatusCheckFailed_Instance",
+            Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
+            StartTime=start_date,
+            EndTime=end_date,
+            Period=300,  # 5 min resolution
+            Statistics=["Sum"]
+        )
+    except (ClientError, BotoCoreError) as e:
+        traceback.print_exc()
+        raise MetricFetchError("Failed to fetch CloudWatch metrics") from e
+
+    datapoints = response.get("Datapoints", [])
+
+    if not datapoints:
+        raise NoDataError("No CloudWatch data found for the given range")
+
+    # Calculate downtime
+    downtime_minutes = 0
+    for dp in datapoints:
+        if dp["Sum"] > 0:
+            downtime_minutes += 5  # Period = 5 minutes
+
+    downtime_hours = downtime_minutes / 60
+
+    # Report
+    print("\n===== EC2 DOWNTIME REPORT =====")
+    print(f"Instance ID : {instance_id}")
+    print(f"Region      : {region}")
+    print(f"Start Date  : {start_date}")
+    print(f"End Date    : {end_date}")
+    print(f"Downtime    : {downtime_minutes} minutes ({downtime_hours:.2f} hours)")
+
+    if downtime_minutes == 0:
+        print("✅ No downtime observed in the given period")
+
+    return downtime_minutes
+
+
+# ---------------- SCRIPT ENTRY ---------------- #
+
+if __name__ == "__main__":
+    try:
+        # USER INPUT
+        INSTANCE_ID = "i-xxxxxxxxxxxx"
+        REGION = "us-east-1"
+
+        # Example: Last 30 days
+        END_DATE = datetime.utcnow()
+        START_DATE = END_DATE - timedelta(days=30)
+
+        get_ec2_downtime(INSTANCE_ID, REGION, START_DATE, END_DATE)
+
+    except Exception as e:
+        print("\n❌ SCRIPT FAILED")
+        traceback.print_exc()
+        raise SystemExit(1)
+
+
+################₹₹₹₹___**********
+
+
+#!/usr/bin/env python3
+"""
+EC2 Downtime Analyzer using CloudTrail Events
+Author: Veera Prakash
+"""
+
+import boto3
+import traceback
+from datetime import datetime, timedelta
+from botocore.exceptions import ClientError, BotoCoreError
+
+# ---------------- CUSTOM EXCEPTIONS ---------------- #
+
+class AWSInitError(Exception):
+    pass
+
+class CloudTrailFetchError(Exception):
+    pass
+
+class DowntimeCalculationError(Exception):
+    pass
+
+
+# ---------------- MAIN FUNCTION ---------------- #
+
+def get_ec2_downtime_from_cloudtrail(instance_id, region, start_date, end_date):
+    try:
+        print("Initializing AWS clients...")
+        ct = boto3.client("cloudtrail", region_name=region)
+        ec2 = boto3.client("ec2", region_name=region)
+    except Exception as e:
+        traceback.print_exc()
+        raise AWSInitError("Failed to initialize AWS clients") from e
+
+    # Validate instance
+    try:
+        ec2.describe_instances(InstanceIds=[instance_id])
+        print(f"Connected to instance {instance_id}")
+    except ClientError as e:
+        traceback.print_exc()
+        raise AWSInitError(f"Instance {instance_id} not found or permission denied") from e
+
+    # Fetch CloudTrail events
+    try:
+        events = []
+        paginator = ct.get_paginator("lookup_events")
+
+        for page in paginator.paginate(
+            LookupAttributes=[
+                {"AttributeKey": "ResourceName", "AttributeValue": instance_id}
+            ],
+            StartTime=start_date,
+            EndTime=end_date,
+        ):
+            events.extend(page["Events"])
+
+    except (ClientError, BotoCoreError) as e:
+        traceback.print_exc()
+        raise CloudTrailFetchError("Failed to fetch CloudTrail logs") from e
+
+    if not events:
+        raise CloudTrailFetchError("No CloudTrail events found in given range")
+
+    # Filter EC2 state change events
+    state_events = []
+    for e in events:
+        if "StopInstances" in e["EventName"] or "StartInstances" in e["EventName"]:
+            state_events.append({
+                "time": e["EventTime"],
+                "event": e["EventName"]
+            })
+
+    if not state_events:
+        print("No start/stop events found. Instance likely always running.")
+        return 0
+
+    # Sort events by time
+    state_events.sort(key=lambda x: x["time"])
+
+    # Calculate downtime
+    downtime_seconds = 0
+    last_stop_time = None
+
+    for ev in state_events:
+        if ev["event"] == "StopInstances":
+            last_stop_time = ev["time"]
+
+        elif ev["event"] == "StartInstances" and last_stop_time:
+            delta = (ev["time"] - last_stop_time).total_seconds()
+            downtime_seconds += delta
+            last_stop_time = None
+
+    # If instance stopped but never started back
+    if last_stop_time:
+        delta = (end_date - last_stop_time).total_seconds()
+        downtime_seconds += delta
+
+    downtime_hours = downtime_seconds / 3600
+
+    # Report
+    print("\n========= EC2 DOWNTIME REPORT (CloudTrail) =========")
+    print(f"Instance ID  : {instance_id}")
+    print(f"Region       : {region}")
+    print(f"Start Date   : {start_date}")
+    print(f"End Date     : {end_date}")
+    print(f"Downtime Sec : {downtime_seconds}")
+    print(f"Downtime Hrs : {downtime_hours:.2f}")
+
+    if downtime_seconds == 0:
+        print("✅ No downtime observed in this period")
+
+    return downtime_seconds
+
+
+# ---------------- SCRIPT ENTRY ---------------- #
+
+if __name__ == "__main__":
+    try:
+        INSTANCE_ID = "i-xxxxxxxxxxxx"
+        REGION = "us-east-1"
+
+        END_DATE = datetime.utcnow()
+        START_DATE = END_DATE - timedelta(days=30)
+
+        get_ec2_downtime_from_cloudtrail(INSTANCE_ID, REGION, START_DATE, END_DATE)
+
+    except Exception as e:
+        print("\n❌ SCRIPT EXECUTION FAILED")
+        traceback.print_exc()
+        raise SystemExit(1)
 
