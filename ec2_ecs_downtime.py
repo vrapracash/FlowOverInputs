@@ -171,3 +171,55 @@ def get_alb_app_downtime(lb_arn, target_group, start, end):
 
     downtime = sum(5 for d in response["Datapoints"] if d["Average"] > 0)
     return downtime
+
+
+
+
+def get_ec2_app_downtime(instance_id, region, start, end):
+    import boto3, traceback
+    from botocore.exceptions import ClientError, BotoCoreError
+
+    try:
+        cw = boto3.client("cloudwatch", region_name=region)
+        print(f"CloudWatch client initialized in {region}")
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception("CloudWatch init failed")
+
+    try:
+        print(f"Fetching metrics for {instance_id}")
+        print(f"Time range: {start} -> {end}")
+
+        response = cw.get_metric_statistics(
+            Namespace="AWS/EC2",
+            MetricName="StatusCheckFailed",
+            Dimensions=[{"Name":"InstanceId","Value":instance_id}],
+            StartTime=start,
+            EndTime=end,
+            Period=300,
+            Statistics=["Sum"]
+        )
+
+        print("RAW RESPONSE:", response)
+
+    except ClientError as e:
+        print("ClientError:", e)
+        traceback.print_exc()
+        raise Exception("IAM or region issue")
+
+    except BotoCoreError as e:
+        print("BotoCoreError:", e)
+        traceback.print_exc()
+        raise Exception("AWS SDK internal failure")
+
+    except Exception as e:
+        print("Unknown error:", e)
+        traceback.print_exc()
+        raise Exception("Metric fetch failed")
+
+    datapoints = response.get("Datapoints", [])
+    if not datapoints:
+        raise Exception("No CloudWatch datapoints returned")
+
+    downtime_minutes = sum(5 for d in datapoints if d["Sum"] > 0)
+    print(f"Downtime Minutes = {downtime_minutes}")
