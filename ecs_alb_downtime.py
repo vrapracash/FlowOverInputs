@@ -6,7 +6,8 @@ from datetime import datetime, timedelta, UTC, date
 import traceback
 
 REGION = "eu-west-1"
-CLUSTER_NAME = "analytics-dashboards-prod"
+# REGION = "me-central-1"
+CLUSTER_NAME = "analytics-dashboards-prod"#"uae-pass-prod-cluster"#
 DAYS = 30
 DATE = date.today()
 
@@ -68,8 +69,8 @@ def get_downtime(tg_name, lb_name, start, end):
                 {"Name": "TargetGroup", "Value": tg_name},
                 {"Name": "LoadBalancer", "Value": lb_name}
             ],
-            StartTime=start,
-            EndTime=end,
+            StartTime=current,      # ✅ FIXED
+            EndTime=chunk_end,       # ✅ FIXED
             Period=60,
             Statistics=["Average"]
         )
@@ -78,20 +79,16 @@ def get_downtime(tg_name, lb_name, start, end):
         current = chunk_end
 
     all_points = sorted(all_points, key=lambda x: x["Timestamp"])
-    # points = sorted(response.get("Datapoints", []), key=lambda x: x["Timestamp"])
 
     if not all_points:
         return None, (end - start).total_seconds() / 60
 
     df = pd.DataFrame(all_points)
-    df["Timestamp"] = df["Timestamp"].dt.tz_localize(None)#pd.to_datetime(df["Timestamp"])
+    df["Timestamp"] = pd.to_datetime(df["Timestamp"]).dt.tz_localize(None)
     df.rename(columns={"Average": "HealthyHosts"}, inplace=True)
 
     downtime = sum(1 for p in all_points if p["Average"] == 0)
     return df, downtime
-
-
-
 
 # ---------- MAIN ----------
 def main():
@@ -133,46 +130,6 @@ def main():
         log(f"  ✅ Downtime: {downtime:.0f} min | Uptime: {uptime:.2f}%")
 
     # Write summary sheet
-
-
-
-
-
-def get_downtime(tg_name, lb_name, start, end):
-    all_points = []
-    delta = timedelta(days=1)
-    current = start
-
-    while current < end:
-        chunk_end = min(current + delta, end)
-
-        response = cw.get_metric_statistics(
-            Namespace="AWS/ApplicationELB",
-            MetricName="HealthyHostCount",
-            Dimensions=[
-                {"Name": "TargetGroup", "Value": tg_name},
-                {"Name": "LoadBalancer", "Value": lb_name}
-            ],
-            StartTime=current,      # ✅ FIXED
-            EndTime=chunk_end,       # ✅ FIXED
-            Period=60,
-            Statistics=["Average"]
-        )
-
-        all_points.extend(response.get("Datapoints", []))
-        current = chunk_end
-
-    all_points = sorted(all_points, key=lambda x: x["Timestamp"])
-
-    if not all_points:
-        return None, (end - start).total_seconds() / 60
-
-    df = pd.DataFrame(all_points)
-    df["Timestamp"] = pd.to_datetime(df["Timestamp"]).dt.tz_localize(None)
-    df.rename(columns={"Average": "HealthyHosts"}, inplace=True)
-
-    downtime = sum(1 for p in all_points if p["Average"] == 0)
-    return df, downtime
     summary_df = pd.DataFrame(summary)
     summary_df.to_excel(writer, sheet_name="SUMMARY", index=False)
     writer.close()
