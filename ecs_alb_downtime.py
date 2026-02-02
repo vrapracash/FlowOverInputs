@@ -181,4 +181,28 @@ df, downtime = get_downtime(tg_name, lb_name, start, end)
     return tg_arn.split(":")[-1], lb_name
 
 
+def get_downtime(tg_name, lb_name, start, end):
+    all_points = []
+    delta = timedelta(days=1)
+    current = start
 
+    while current < end:
+        chunk_end = min(current + delta, end)
+
+        response = cw.get_metric_statistics(
+            Namespace="AWS/ApplicationELB",
+            MetricName="HealthyHostCount",
+            Dimensions=[
+                {"Name": "TargetGroup", "Value": tg_name},
+                {"Name": "LoadBalancer", "Value": lb_name}
+            ],
+            StartTime=current,
+            EndTime=chunk_end,
+            Period=60,
+            Statistics=["Average"]
+        )
+
+        all_points.extend(response.get("Datapoints", []))
+        current = chunk_end
+
+    all_points = sorted(all_points, key=lambda x: x["Timestamp"])
