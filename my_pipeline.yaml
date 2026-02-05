@@ -1,0 +1,234 @@
+variables:
+  SONAR_PROJECT_KEY: 'cash_bd_ada-ppi'
+  PROJECT_CULSTER_NAME_UAT: "cash_bd_ada-ppi"  
+  ECR_REPO_NAME_UAT: 'cash_bd_ada-ppi-uat'
+  PROJECT_SERVICE_NAME_UAT: "cash_bd_ada-ppi-uat"
+  PROJECT_TASK_DEFINITION_NAME_UAT: "cash_bd_ada-ppi-uat"
+  PROJECT_IMAGE_TAG_UAT: "vf-db-uat"
+
+  PROJECT_CULSTER_NAME_PROD: "cash_bd_ada-ppi"  
+  ECR_REPO_NAME_PROD: 'cash_bd_ada-ppi-prod'
+  PROJECT_SERVICE_NAME_PROD: "cash_bd_ada-ppi-prod"
+  PROJECT_TASK_DEFINITION_NAME_PROD: "cash_bd_ada-ppi-prod"
+  PROJECT_IMAGE_TAG_PROD: "vf-db-prod"
+
+stages:
+  - uat_tag_release
+  - sonar_and_trivy
+  - build_image_push_to_ecr_uat_tag
+  - deploy_uat_tag
+
+  - prod_tag_release
+  - build_image_push_to_ecr_prod_tag
+  - deploy_prod_tag
+ 
+uat_tag_release:
+  stage: uat_tag_release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest 
+  rules:
+    - if: $CI_COMMIT_BRANCH == "uat"
+      when: always    
+  script:
+    - wget "https://gitlab.com/gitlab-org/release-cli/-/releases/v0.15.0/downloads/bin/release-cli-linux-amd64"
+    - cp release-cli-linux-amd64 release-cli
+    - uname -a
+    - chmod a+x release-cli
+    - tag_sha=$CI_COMMIT_SHORT_SHA
+    - export COMMIT_TAG="uat-$tag_sha"
+    - ./release-cli --server-url https://gitlab.com create --name "Release $COMMIT_TAG" --tag-name $COMMIT_TAG
+  tags: 
+    - verygudfl-linux
+
+prod_tag_release:
+  stage: prod_tag_release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest 
+  rules:
+    - if: $CI_COMMIT_BRANCH == "release"
+      when: always    
+  script:
+    - wget "https://gitlab.com/gitlab-org/release-cli/-/releases/v0.15.0/downloads/bin/release-cli-linux-amd64"
+    - cp release-cli-linux-amd64 release-cli
+    - uname -a
+    - chmod a+x release-cli
+    - tag_sha=$CI_COMMIT_SHORT_SHA
+    - export COMMIT_TAG="prod-$tag_sha"
+    - ./release-cli --server-url https://gitlab.com create --name "Release $COMMIT_TAG" --tag-name $COMMIT_TAG
+  tags: 
+    - verygudfl-linux
+
+
+
+sonar_analysis:
+  stage: sonar_and_trivy
+  tags:
+    - verygudfl-linux
+  script:
+    - echo 'Starting SonarQube analysis....'
+    - /opt/sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=$SONAR_PROJECT_KEY -Dsonar.sources=. -Dsonar.host.url=$SONAR_URL -Dsonar.login=$SONARQUBE_TOKEN -Dsonar.qualitygate.timeout=600 -Dsonar.qualitygate.wait=true
+  only:
+    - /^(uat)+-?.*$/
+  except:
+    - branches 
+  allow_failure: true
+
+
+trivy_scan_uat:
+  stage: sonar_and_trivy
+  script:
+    - IMAGE_TAG_UAT="uat-$CI_COMMIT_SHORT_SHA"
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login -u AWS --password-stdin $ECR_URL
+    - docker build -f DockerfileUAT -t $IMAGE_TAG_UAT .
+    
+    # Run Trivy scans
+    - sudo trivy image --severity CRITICAL,HIGH --format template --template "@/usr/local/share/trivy/templates/html.tpl" -o "trivy-image-report.html" $IMAGE_TAG_UAT:latest
+    - sudo trivy image --severity CRITICAL,HIGH -f json -o $CI_COMMIT_SHORT_SHA-trivy-report.json $IMAGE_TAG_UAT:latest
+    - jq -r '.Results[]? | (.Vulnerabilities // [])[]? | [.VulnerabilityID, .PkgName, .InstalledVersion, .FixedVersion, .Severity, .Title] | @csv' $CI_COMMIT_SHORT_SHA-trivy-report.json > $CI_COMMIT_SHORT_SHA-trivy-report.csv
+    
+    # Upload reports to S3
+    - aws s3 cp "trivy-image-report.html" "s3://trivy-security-report/${CI_PROJECT_NAME}/$(date +"%m-%d-%Y")/$CI_COMMIT_SHORT_SHA-trivy-report.html"
+    - aws s3 cp "$CI_COMMIT_SHORT_SHA-trivy-report.csv" "s3://trivy-security-report/${CI_PROJECT_NAME}/$(date +"%m-%d-%Y")/$CI_COMMIT_SHORT_SHA-trivy-report.csv"
+
+    # Generate pre-signed URL (valid for 7 days)
+    - PRESIGNED_URL=$(aws s3 presign "s3://trivy-security-report/${CI_PROJECT_NAME}/$(date +"%m-%d-%Y")/$CI_COMMIT_SHORT_SHA-trivy-report.html" --expires-in 604800)
+    
+    # Send both structured data to SNS (for Lambda processing) and human-readable message
+    
+    - >
+      aws sns publish
+      --topic-arn "arn:aws:sns:eu-west-1:900111020000:TrivySecurityReports"
+      --subject "Trivy Scan Data: ${CI_PROJECT_NAME}"
+      --message '{
+        "project_name": "'"${CI_PROJECT_NAME}"'",
+        "commit_sha": "'"${CI_COMMIT_SHORT_SHA}"'",
+        "date": "'"$(date +"%m-%d-%Y")"'",
+        "presigned_url": "'"${PRESIGNED_URL}"'",
+        "severity_filter": "CRITICAL,HIGH",
+        "scan_type": "image"
+      }'
+
+  only:
+    - /^(uat)+-?.*$/  
+  except:
+    - branches
+  allow_failure: true
+  tags:
+    - verygudfl-linux
+
+
+   
+build_image_push_to_ecr_uat_tag:
+   stage: build_image_push_to_ecr_uat_tag
+   tags:
+     - verygudfl-linux
+
+   image: docker:24.0.2-cli
+   services:
+      - name: docker:24.0.2-dind
+        command: [ "--tls=false" ]
+   variables:
+     DOCKER_TLS_CERTDIR: ""
+   before_script:
+     - sudo apt-get update -y
+   script:
+     - export VERSION=$(date +%y.%m.%d)
+     - IMAGE_TAG_UAT="uat-$CI_COMMIT_SHORT_SHA"
+     - sudo docker build --no-cache -f DockerfileUAT -t $IMAGE_TAG_UAT .
+     - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+     - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+     - aws configure set aws_region $AWS_DEFAULT_REGION
+     - echo $AWS_ACCESS_KEY_ID ; echo $AWS_DEFAULT_REGION; echo $ECR_URL
+     - aws ecr get-login-password --region eu-west-1 | sudo docker login -u AWS --password-stdin 900111020000.dkr.ecr.eu-west-1.amazonaws.com
+     - sudo docker tag $IMAGE_TAG_UAT:latest 900111020000.dkr.ecr.eu-west-1.amazonaws.com/$ECR_REPO_NAME_UAT:$IMAGE_TAG_UAT
+     - sudo docker push 900111020000.dkr.ecr.eu-west-1.amazonaws.com/$ECR_REPO_NAME_UAT:$IMAGE_TAG_UAT
+   only:
+    - /^(uat)+-?.*$/
+   except:
+    - branches
+   allow_failure: false
+
+
+build_image_push_to_ecr_prod_tag:
+   stage: build_image_push_to_ecr_prod_tag
+   tags:
+     - verygudfl-linux
+
+   image: docker:24.0.2-cli
+   services:
+      - name: docker:24.0.2-dind
+        command: [ "--tls=false" ]
+   variables:
+     DOCKER_TLS_CERTDIR: ""
+   before_script:
+     - sudo apt-get update -y
+   script:
+     - export VERSION=$(date +%y.%m.%d)
+     - IMAGE_TAG_PROD="prod-$CI_COMMIT_SHORT_SHA"
+     - sudo docker build --no-cache -t $IMAGE_TAG_PROD -f Dockerfile .
+     - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+     - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+     - aws configure set aws_region $AWS_DEFAULT_REGION
+     - echo $AWS_ACCESS_KEY_ID ; echo $AWS_DEFAULT_REGION; echo $ECR_URL
+     - aws ecr get-login-password --region eu-west-1 | sudo docker login -u AWS --password-stdin 900111020000.dkr.ecr.eu-west-1.amazonaws.com
+     - sudo docker tag $IMAGE_TAG_PROD:latest 900111020000.dkr.ecr.eu-west-1.amazonaws.com/$ECR_REPO_NAME_PROD:$IMAGE_TAG_PROD
+     - sudo docker push 900111020000.dkr.ecr.eu-west-1.amazonaws.com/$ECR_REPO_NAME_PROD:$IMAGE_TAG_PROD
+   only:
+    - /^(prod)+-?.*$/
+   except:
+    - branches
+   allow_failure: false
+
+
+deploy_uat_tag:
+   stage: deploy_uat_tag
+   needs:
+     - build_image_push_to_ecr_uat_tag
+   tags:
+     - verygudfl-linux
+
+   script:
+     - echo 'Deploying build on uat....'
+     - export VERSION=$(date +%y.%m.%d)
+     - IMAGE_TAG_UAT="uat-$CI_COMMIT_SHORT_SHA"
+     - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+     - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+     - aws configure set aws_region $AWS_DEFAULT_REGION
+     - echo $AWS_ACCESS_KEY_ID ; echo $AWS_DEFAULT_REGION
+
+     - taskDefinition=$(aws ecs describe-task-definition --task-definition $PROJECT_TASK_DEFINITION_NAME_UAT)
+     - newImage=900111020000.dkr.ecr.eu-west-1.amazonaws.com/$ECR_REPO_NAME_UAT:$IMAGE_TAG_UAT
+     - echo $taskDefinition | jq --arg image "$newImage" '.taskDefinition | .containerDefinitions[0].image = $image | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.compatibilities) | del(.requiresAttributes) | del(.registeredAt) | del(.registeredBy)' > taskDef.json
+     - latestRevision=$(aws ecs register-task-definition --requires-compatibilities "FARGATE" --cpu 512 --memory 1024  --execution-role-arn arn:aws:iam::900111020000:role/ecsTaskExecutionRole --cli-input-json file://taskDef.json --query taskDefinition.revision --output text | awk -F[ '{print $1}')
+     - aws ecs update-service --cluster $PROJECT_CULSTER_NAME_UAT --service $PROJECT_SERVICE_NAME_UAT --task-definition  $PROJECT_TASK_DEFINITION_NAME_UAT:$latestRevision
+   only:
+    - /^(uat)+-?.*$/
+   except:
+    - branches
+   allow_failure: false
+
+
+deploy_prod_tag:
+   stage: deploy_prod_tag
+   needs:
+     - build_image_push_to_ecr_prod_tag
+   tags:
+     - verygudfl-linux
+   when: manual
+   script:
+     - echo 'Deploying build on prod....'
+     - export VERSION=$(date +%y.%m.%d)
+     - IMAGE_TAG_PROD="prod-$CI_COMMIT_SHORT_SHA"
+     - aws configure set aws_access_key_id $AWS_ACCESS_KEY_ID
+     - aws configure set aws_secret_access_key $AWS_SECRET_ACCESS_KEY
+     - aws configure set aws_region $AWS_DEFAULT_REGION
+     - echo $AWS_ACCESS_KEY_ID ; echo $AWS_DEFAULT_REGION
+
+     - taskDefinition=$(aws ecs describe-task-definition --task-definition $PROJECT_TASK_DEFINITION_NAME_PROD)
+     - newImage=900111020000.dkr.ecr.eu-west-1.amazonaws.com/$ECR_REPO_NAME_PROD:$IMAGE_TAG_PROD
+     - echo $taskDefinition | jq --arg image "$newImage" '.taskDefinition | .containerDefinitions[0].image = $image | del(.taskDefinitionArn) | del(.revision) | del(.status) | del(.compatibilities) | del(.requiresAttributes) | del(.registeredAt) | del(.registeredBy)' > taskDef.json
+     - latestRevision=$(aws ecs register-task-definition --requires-compatibilities "FARGATE" --cpu 2048 --memory 4096  --execution-role-arn arn:aws:iam::900111020000:role/ecsTaskExecutionRole --cli-input-json file://taskDef.json --query taskDefinition.revision --output text | awk -F[ '{print $1}')
+     - aws ecs update-service --cluster $PROJECT_CULSTER_NAME_PROD --service $PROJECT_SERVICE_NAME_PROD --task-definition  $PROJECT_TASK_DEFINITION_NAME_PROD:$latestRevision
+   only:
+    - /^(prod)+-?.*$/
+   except:
+    - branches
+   allow_failure: false
