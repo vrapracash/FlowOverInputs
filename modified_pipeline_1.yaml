@@ -3,12 +3,13 @@ variables:
   AWS_REGION: eu-west-1
   AWS_ACCOUNT_ID: "900111020000"
 
-  PROJECT_NAME: "cash_bd_ada-ppi"
-  ECR_REPO_UAT: "cash_bd_ada-ppi-uat"
-  ECR_REPO_PROD: "cash_bd_ada-ppi-prod"
+  SONAR_PROJECT_KEY: "cash_bd_ada-ppi"
 
   ECS_CLUSTER_UAT: "cash_bd_ada-ppi"
   ECS_CLUSTER_PROD: "cash_bd_ada-ppi"
+
+  ECR_REPO_UAT: "cash_bd_ada-ppi-uat"
+  ECR_REPO_PROD: "cash_bd_ada-ppi-prod"
 
   ECS_SERVICE_UAT: "cash_bd_ada-ppi-uat"
   ECS_SERVICE_PROD: "cash_bd_ada-ppi-prod"
@@ -20,38 +21,56 @@ variables:
 
 # ================= STAGES =================
 stages:
-  - test
-  - sonar
+  - release
+  - quality
   - build
   - security
   - push
-  - deploy-uat
-  - deploy-prod
+  - deploy
 
-# ================= CODE QUALITY =================
+# ================= TAG RELEASE =================
+uat_tag_release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "uat"'
+  script:
+    - export COMMIT_TAG="uat-$CI_COMMIT_SHORT_SHA"
+    - release-cli create --name "Release $COMMIT_TAG" --tag-name $COMMIT_TAG
+  tags: [verygudfl-linux]
+
+prod_tag_release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "release"'
+  script:
+    - export COMMIT_TAG="prod-$CI_COMMIT_SHORT_SHA"
+    - release-cli create --name "Release $COMMIT_TAG" --tag-name $COMMIT_TAG
+  tags: [verygudfl-linux]
+
+# ================= SONAR =================
 sonar_scan:
-  stage: sonar
-  image: sonarsource/sonar-scanner-cli
+  stage: quality
+  tags: [verygudfl-linux]
+  script:
+    - sonar-scanner -Dsonar.projectKey=$SONAR_PROJECT_KEY
   rules:
     - if: '$CI_COMMIT_BRANCH =~ /(uat|release)/'
-  script:
-    - sonar-scanner
   allow_failure: false
 
-# ================= BUILD DOCKER IMAGE =================
+# ================= BUILD IMAGE (ONCE) =================
 docker_build:
   stage: build
   image: docker:24
-  services:
-    - docker:dind
+  services: [docker:24-dind]
   variables:
     DOCKER_TLS_CERTDIR: ""
   script:
-    - docker build -t $PROJECT_NAME:$IMAGE_TAG .
-    - docker save $PROJECT_NAME:$IMAGE_TAG > image.tar
+    - docker build -t app:$IMAGE_TAG .
+    - docker save app:$IMAGE_TAG > image.tar
   artifacts:
-    paths:
-      - image.tar
+    paths: [image.tar]
     expire_in: 1 day
 
 # ================= TRIVY SECURITY SCAN =================
@@ -61,67 +80,62 @@ trivy_scan:
   needs: ["docker_build"]
   script:
     - docker load < image.tar
-    - trivy image --severity CRITICAL,HIGH --exit-code 1 $PROJECT_NAME:$IMAGE_TAG
+    - trivy image --severity CRITICAL,HIGH --exit-code 1 app:$IMAGE_TAG
   allow_failure: false
 
-# ================= PUSH TO AWS ECR =================
+# ================= PUSH TO ECR UAT =================
 push_ecr_uat:
   stage: push
   needs: ["docker_build"]
   rules:
     - if: '$CI_COMMIT_BRANCH == "uat"'
   image: docker:24
-  services:
-    - docker:dind
+  services: [docker:24-dind]
   script:
     - docker load < image.tar
     - aws ecr get-login-password --region $AWS_REGION |
       docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-    - docker tag $PROJECT_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_UAT:$IMAGE_TAG
+    - docker tag app:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_UAT:$IMAGE_TAG
     - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_UAT:$IMAGE_TAG
 
+# ================= PUSH TO ECR PROD =================
 push_ecr_prod:
   stage: push
   needs: ["docker_build"]
   rules:
     - if: '$CI_COMMIT_BRANCH == "release"'
   image: docker:24
-  services:
-    - docker:dind
+  services: [docker:24-dind]
   script:
     - docker load < image.tar
     - aws ecr get-login-password --region $AWS_REGION |
       docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-    - docker tag $PROJECT_NAME:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PROD:$IMAGE_TAG
+    - docker tag app:$IMAGE_TAG $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PROD:$IMAGE_TAG
     - docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PROD:$IMAGE_TAG
 
-# ================= DEPLOY TO ECS UAT =================
+# ================= DEPLOY UAT =================
 deploy_uat:
-  stage: deploy-uat
-  environment: uat
+  stage: deploy
   needs: ["push_ecr_uat"]
+  environment: uat
   rules:
     - if: '$CI_COMMIT_BRANCH == "uat"'
   script:
-    - IMAGE="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_UAT:$IMAGE_TAG"
     - aws ecs update-service --cluster $ECS_CLUSTER_UAT \
         --service $ECS_SERVICE_UAT \
-        --force-new-deployment \
-        --task-definition $TASK_DEF_UAT
+        --force-new-deployment
 
-# ================= DEPLOY TO ECS PROD (MANUAL APPROVAL) =================
+# ================= DEPLOY PROD (MANUAL) =================
 deploy_prod:
-  stage: deploy-prod
+  stage: deploy
   environment:
     name: prod
-    url: https://prod.company.com
+    deployment_tier: production
   when: manual
   needs: ["push_ecr_prod"]
   rules:
     - if: '$CI_COMMIT_BRANCH == "release"'
   script:
-    - IMAGE="$AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO_PROD:$IMAGE_TAG"
     - aws ecs update-service --cluster $ECS_CLUSTER_PROD \
         --service $ECS_SERVICE_PROD \
-        --force-new-deployment \
-        --task-definition $TASK_DEF_PROD
+        --force-new-deployment
